@@ -1,0 +1,674 @@
+<?php
+// instructor/manage_questions.php (إدارة أسئلة اختبار محدد)
+
+// 1. التحقق من الصلاحيات والملفات الأساسية
+require_once __DIR__ . '/../includes/check_auth.php';
+if (!isset($_SESSION['user_role']) || !in_array($_SESSION['user_role'], ['instructor', 'admin'])) {
+    $_SESSION['error_message'] = "غير مصرح لك بالوصول.";
+    redirect('../dashboard.php');
+}
+require_once __DIR__ . '/../includes/connection.php';
+require_once __DIR__ . '/../includes/functions.php';
+
+$instructorId = $_SESSION['user_id'];
+$test_id = filter_input(INPUT_GET, 'test_id', FILTER_VALIDATE_INT);
+
+if (!$test_id) {
+    $_SESSION['error_message'] = "معرف الاختبار غير محدد.";
+    redirect('instructor/manage_tests.php'); 
+}
+
+// 2. التحقق من أن الاختبار يتبع دورة يملكها المدرب الحالي (أو مدير)
+$test = null;
+$course = null;
+try {
+    $sql_check_owner = "
+        SELECT t.test_id, t.title AS test_title, c.course_id, c.title AS course_title
+        FROM tests t
+        JOIN courses c ON t.course_id = c.course_id
+        WHERE t.test_id = :tid";
+
+    $params_check = [':tid' => $test_id];
+
+    // إذا لم يكن مديرًا، أضف شرط ملكية الدورة
+    if ($_SESSION['user_role'] !== 'admin') {
+        $sql_check_owner .= " AND c.instructor_id = :iid";
+        $params_check[':iid'] = $instructorId;
+    }
+
+    $stmt_check = $pdo->prepare($sql_check_owner);
+    $stmt_check->execute($params_check);
+    $test = $stmt_check->fetch();
+
+    if (!$test) {
+        $_SESSION['error_message'] = "الاختبار غير موجود أو لا تملك الصلاحية لإدارة أسئلته.";
+        redirect('instructor/manage_tests.php');
+    }
+    $course = ['course_id' => $test['course_id'], 'title' => $test['course_title']]; 
+
+} catch (PDOException $e) {
+     error_log("Instructor Manage Questions Check Error: " . $e->getMessage());
+     $_SESSION['error_message'] = "خطأ في التحقق من ملكية الاختبار: " . $e->getMessage();
+     redirect('instructor/manage_tests.php');
+}
+
+$errors = [];
+$editQuestion = null; 
+$editOptions = []; 
+
+// --- معالجة إضافة/تعديل/حذف سؤال أو خيار ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $question_id = filter_input(INPUT_POST, 'question_id', FILTER_VALIDATE_INT);
+    $option_id = filter_input(INPUT_POST, 'option_id', FILTER_VALIDATE_INT);
+
+    // -- حذف سؤال --
+    if ($action === 'delete_question' && $question_id) {
+         try {
+             $stmt = $pdo->prepare("DELETE FROM questions WHERE question_id = :qid AND test_id = :tid");
+             $stmt->bindParam(':qid', $question_id, PDO::PARAM_INT);
+             $stmt->bindParam(':tid', $test_id, PDO::PARAM_INT); 
+             if ($stmt->execute()) {
+                 $_SESSION['success_message'] = "تم حذف السؤال وخياراته بنجاح.";
+             } else {
+                  $_SESSION['error_message'] = "لم يتم حذف السؤال.";
+             }
+         } catch (PDOException $e) {
+             error_log("Instructor Delete Question Error: " . $e->getMessage());
+             $_SESSION['error_message'] = "خطأ أثناء حذف السؤال: " . $e->getMessage();
+         }
+         redirect('instructor/manage_questions.php?test_id=' . $test_id);
+    }
+
+    // -- حذف خيار --
+    elseif ($action === 'delete_option' && $option_id && $question_id) {
+         try {
+             $stmt = $pdo->prepare("DELETE FROM question_options WHERE option_id = :oid AND question_id = :qid");
+             $stmt->bindParam(':oid', $option_id, PDO::PARAM_INT);
+             $stmt->bindParam(':qid', $question_id, PDO::PARAM_INT);
+             if ($stmt->execute()) {
+                  $_SESSION['success_message'] = "تم حذف الخيار بنجاح.";
+             } else {
+                   $_SESSION['error_message'] = "لم يتم حذف الخيار.";
+             }
+         } catch (PDOException $e) {
+             error_log("Instructor Delete Option Error: " . $e->getMessage());
+             $_SESSION['error_message'] = "خطأ أثناء حذف الخيار: " . $e->getMessage();
+         }
+         redirect('instructor/manage_questions.php?test_id=' . $test_id . '&edit_id=' . $question_id);
+    }
+
+    // -- إضافة أو تعديل سؤال --
+    elseif ($action === 'save_question') {
+         $question_text = trim($_POST['question_text'] ?? '');
+         // *** تعديل: إزالة SHORT_ANSWER من القيم المسموح بها ***
+         $allowed_question_types = ['MCQ', 'TRUE_FALSE'];
+         $question_type = in_array($_POST['question_type'] ?? '', $allowed_question_types) ? $_POST['question_type'] : null;
+         $question_order = filter_input(INPUT_POST, 'question_order', FILTER_VALIDATE_INT, ['options' => ['default' => 0]]);
+
+         // التحقق الأساسي
+         if (empty($question_text)) $errors[] = "نص السؤال مطلوب.";
+         if (empty($question_type)) $errors[] = "نوع السؤال مطلوب.";
+         // *** تعديل: إضافة خطأ إذا كان نوع السؤال هو SHORT_ANSWER (في حال حاول شخص ما التلاعب بالنموذج) ***
+         if (($question_type === 'SHORT_ANSWER') && !empty($_POST['question_type'])) {
+             $errors[] = "نوع السؤال 'إجابة قصيرة' غير مدعوم حالياً.";
+             $question_type = null; // اجعله فارغاً لمنع حفظه
+         }
+
+
+         // Store current POST data for form re-population on error
+         $current_post_data = [
+             'question_id' => $question_id,
+             'question_text' => $question_text,
+             'question_type' => $question_type,
+             'question_order' => $question_order
+         ];
+
+         // منطق التحقق الخاص بالخيارات بناءً على نوع السؤال
+         $options_to_save = [];
+         $is_options_valid = true; 
+
+         if ($question_type === 'MCQ') {
+             $options_text = $_POST['options']['text'] ?? [];
+             $correct_option_index = isset($_POST['options']['correct']) ? intval($_POST['options']['correct']) : null;
+             $options_ids = $_POST['options']['id'] ?? [];
+
+             $valid_option_count = 0;
+             $posted_mcq_options_for_repop = []; // for re-populating form on error
+
+             foreach ($options_text as $index => $text) {
+                 $text = trim($text);
+                 // Only process non-empty options for saving to DB
+                 if (!empty($text)) {
+                     $valid_option_count++;
+                     $is_correct = ($index === $correct_option_index);
+                     
+                     $options_to_save[] = [
+                         'id' => filter_var($options_ids[$index] ?? null, FILTER_VALIDATE_INT),
+                         'text' => $text,
+                         'is_correct' => $is_correct
+                     ];
+                 }
+                 // Store ALL posted options for re-population, even empty ones, to keep form state
+                 $posted_mcq_options_for_repop[] = [
+                    'option_id' => filter_var($options_ids[$index] ?? null, FILTER_VALIDATE_INT),
+                    'option_text' => $text,
+                    'is_correct' => ($index === $correct_option_index)
+                 ];
+             }
+             $editOptions = $posted_mcq_options_for_repop; 
+
+             if ($valid_option_count < 2) {
+                 $errors[] = "لأسئلة الاختيار من متعدد، يجب توفير خيارين نصيين على الأقل.";
+                 $is_options_valid = false;
+             }
+             // Only check for correct answer if there are valid options
+             if ($valid_option_count > 0 && $correct_option_index === null) { 
+                 $errors[] = "لأسئلة الاختيار من متعدد، يجب تحديد إجابة صحيحة واحدة.";
+                 $is_options_valid = false;
+             }
+             // Ensure the selected correct index actually maps to a non-empty option text
+             if ($correct_option_index !== null && empty(trim($options_text[$correct_option_index] ?? ''))) {
+                $errors[] = "الخيار الصحيح المحدد لا يمكن أن يكون فارغاً.";
+                $is_options_valid = false;
+             }
+
+         } elseif ($question_type === 'TRUE_FALSE') {
+             $true_false_correct_val = isset($_POST['true_false_correct']) ? intval($_POST['true_false_correct']) : null;
+             if (!($true_false_correct_val === 0 || $true_false_correct_val === 1)) {
+                 $errors[] = "لسؤال صح/خطأ، يجب تحديد الإجابة الصحيحة (صحيح أو خطأ).";
+                 $is_options_valid = false;
+             } else {
+                 // Assuming you have specific option_ids for True and False (e.g., 1 for True, 0 for False)
+                 // This part needs adjustment based on how your TRUE_FALSE options are actually stored in question_options
+                 // My previous solution assumed true/false options exist as actual option_id records.
+                 // Let's ensure we fetch existing TRUE/FALSE option IDs if editing, or create placeholder IDs for new.
+                 $true_option_id = null;
+                 $false_option_id = null;
+
+                 // If editing an existing TRUE_FALSE question, get its specific option_ids
+                 if ($question_id) {
+                     $stmt_tf_options = $pdo->prepare("SELECT option_id, option_text FROM question_options WHERE question_id = :qid");
+                     $stmt_tf_options->bindParam(':qid', $question_id, PDO::PARAM_INT);
+                     $stmt_tf_options->execute();
+                     $existing_tf_options = $stmt_tf_options->fetchAll(PDO::FETCH_ASSOC);
+
+                     foreach ($existing_tf_options as $tf_opt) {
+                         if (strtolower($tf_opt['option_text']) == 'صحيح' || strtolower($tf_opt['option_text']) == 'true') {
+                             $true_option_id = $tf_opt['option_id'];
+                         } elseif (strtolower($tf_opt['option_text']) == 'خطأ' || strtolower($tf_opt['option_text']) == 'false') {
+                             $false_option_id = $tf_opt['option_id'];
+                         }
+                     }
+                 }
+
+                 // Prepare options to save using their actual IDs or as new if null
+                 $options_to_save[] = ['id' => $true_option_id, 'text' => 'صحيح', 'is_correct' => ($true_false_correct_val === 1)];
+                 $options_to_save[] = ['id' => $false_option_id, 'text' => 'خطأ', 'is_correct' => ($true_false_correct_val === 0)];
+                 
+                 $editOptions = [ // For re-populating the form on error
+                     ['option_text' => 'صحيح', 'is_correct' => ($true_false_correct_val === 1), 'option_id' => $true_option_id],
+                     ['option_text' => 'خطأ', 'is_correct' => ($true_false_correct_val === 0), 'option_id' => $false_option_id]
+                 ];
+             }
+         }
+         // *** تم إزالة معالجة SHORT_ANSWER هنا. تأكد من أن هذا يتوافق مع قرارك. ***
+         // If SHORT_ANSWER was selected (and PHP validation passed), it means no options are needed in question_options.
+
+         if (empty($errors) && $is_options_valid) {
+             $pdo->beginTransaction();
+             try {
+                 $old_question_type = null;
+                 if ($question_id) {
+                     // Get old question type before update
+                     $stmt_old_type = $pdo->prepare("SELECT question_type FROM questions WHERE question_id = :qid");
+                     $stmt_old_type->bindParam(':qid', $question_id);
+                     $stmt_old_type->execute();
+                     $old_question_type = $stmt_old_type->fetchColumn();
+
+                     $sql_q = "UPDATE questions SET question_text = :qt, question_type = :qty, question_order = :qo, updated_at = NOW() WHERE question_id = :qid AND test_id = :tid";
+                     $stmt_q = $pdo->prepare($sql_q);
+                     $stmt_q->bindParam(':qid', $question_id, PDO::PARAM_INT);
+                     $successMsg = "تم تحديث السؤال بنجاح.";
+                 } else {
+                     $sql_q = "INSERT INTO questions (test_id, question_text, question_type, question_order, created_at, updated_at) VALUES (:tid, :qt, :qty, :qo, NOW(), NOW())";
+                     $stmt_q = $pdo->prepare($sql_q);
+                     $successMsg = "تمت إضافة السؤال بنجاح.";
+                 }
+                 $stmt_q->bindParam(':tid', $test_id, PDO::PARAM_INT);
+                 $stmt_q->bindParam(':qt', $question_text);
+                 $stmt_q->bindParam(':qty', $question_type);
+                 $stmt_q->bindParam(':qo', $question_order, PDO::PARAM_INT);
+                 $stmt_q->execute();
+
+                 if (!$question_id) {
+                     $question_id = $pdo->lastInsertId();
+                 }
+
+                 // Clean up old options if question type changed OR if it's now a type that doesn't use question_options (e.g. SHORT_ANSWER removed)
+                 // If $old_question_type was SHORT_ANSWER and new is MCQ/TF, we are adding options.
+                 // If $old_question_type was MCQ/TF and new is SHORT_ANSWER (which is now prevented, but as safeguard), we delete.
+                 // *** تعديل: إزالة تنظيف الخيارات إذا كان النوع الجديد هو SHORT_ANSWER، لأنه لا يمكن الوصول إليه الآن ***
+                 if ($old_question_type && $old_question_type !== $question_type) {
+                     $stmt_del_old_opt = $pdo->prepare("DELETE FROM question_options WHERE question_id = :qid");
+                     $stmt_del_old_opt->bindParam(':qid', $question_id, PDO::PARAM_INT);
+                     $stmt_del_old_opt->execute();
+                 }
+
+                 // Process and save new options based on type (only for MCQ or TRUE_FALSE)
+                 if ($question_type === 'MCQ' || $question_type === 'TRUE_FALSE') {
+                    $stmt_update_opt = $pdo->prepare("UPDATE question_options SET option_text = :ot, is_correct = :correct, updated_at = NOW() WHERE option_id = :oid AND question_id = :qid");
+                    $stmt_insert_opt = $pdo->prepare("INSERT INTO question_options (question_id, option_text, is_correct, created_at, updated_at) VALUES (:qid, :ot, :correct, NOW(), NOW())");
+
+                     foreach ($options_to_save as $option_data) {
+                         if (isset($option_data['id']) && $option_data['id']) { // Update existing option if ID is provided
+                             $stmt_update_opt->bindParam(':ot', $option_data['text']);
+                             $stmt_update_opt->bindParam(':correct', $option_data['is_correct'], PDO::PARAM_BOOL);
+                             $stmt_update_opt->bindParam(':oid', $option_data['id'], PDO::PARAM_INT);
+                             $stmt_update_opt->bindParam(':qid', $question_id, PDO::PARAM_INT);
+                             $stmt_update_opt->execute();
+                         } else { // Insert new option
+                             $stmt_insert_opt->bindParam(':qid', $question_id, PDO::PARAM_INT);
+                             $stmt_insert_opt->bindParam(':ot', $option_data['text']);
+                             $stmt_insert_opt->bindParam(':correct', $option_data['is_correct'], PDO::PARAM_BOOL);
+                             $stmt_insert_opt->execute();
+                         }
+                     }
+                 }
+                 // SHORT_ANSWER requires no options saving here.
+
+                 $pdo->commit();
+                 $_SESSION['success_message'] = $successMsg;
+                 redirect('instructor/manage_questions.php?test_id=' . $test_id); 
+
+             } catch (Exception $e) {
+                 $pdo->rollBack();
+                 error_log("Instructor Save Question Error: " . $e->getMessage());
+                 $errors[] = "حدث خطأ أثناء حفظ السؤال أو خياراته: " . $e->getMessage();
+                  // Re-populate form on DB error, keeping current_post_data and editOptions
+                  $editQuestion = $current_post_data;
+             }
+         } else {
+            // If there were validation errors, re-populate the form
+            $editQuestion = $current_post_data;
+            // editOptions already holds the posted data from MCQ/TF validation block
+         }
+    }
+}
+
+// --- جلب سؤال للتعديل إذا طُلب (عند تحميل الصفحة لأول مرة مع edit_id) ---
+if (!$editQuestion && isset($_GET['edit_id'])) {
+    $edit_id = filter_var($_GET['edit_id'], FILTER_VALIDATE_INT);
+    if ($edit_id) {
+        try {
+            $stmt_edit_q = $pdo->prepare("SELECT * FROM questions WHERE question_id = :qid AND test_id = :tid");
+            $stmt_edit_q->bindParam(':qid', $edit_id, PDO::PARAM_INT);
+            $stmt_edit_q->bindParam(':tid', $test_id, PDO::PARAM_INT);
+            $stmt_edit_q->execute();
+            $editQuestion = $stmt_edit_q->fetch();
+
+            if ($editQuestion) {
+                // *** تعديل: إذا كان نوع السؤال الذي يتم تعديله هو SHORT_ANSWER، قم بتحويله لـ NULL أو غير مسموح به
+                if ($editQuestion['question_type'] === 'SHORT_ANSWER') {
+                    $_SESSION['error_message'] = "نوع السؤال 'إجابة قصيرة' غير مدعوم حالياً للتعديل.";
+                    // يمكنك اختيار توجيه المستخدم أو جعله يختار نوعاً آخر
+                    // redirect('instructor/manage_questions.php?test_id=' . $test_id); 
+                    // حالياً، سأعرضه كما هو ولكن سيمنع حفظه لاحقاً
+                }
+                
+                if ($editQuestion['question_type'] === 'MCQ' || $editQuestion['question_type'] === 'TRUE_FALSE') {
+                    $stmt_edit_o = $pdo->prepare("SELECT * FROM question_options WHERE question_id = :qid ORDER BY option_id ASC");
+                    $stmt_edit_o->bindParam(':qid', $edit_id, PDO::PARAM_INT);
+                    $stmt_edit_o->execute();
+                    $editOptions = $stmt_edit_o->fetchAll();
+                }
+            } else {
+                 $_SESSION['error_message'] = "السؤال المطلوب للتعديل غير موجود أو لا يتبع لهذا الاختبار.";
+            }
+        } catch (PDOException $e) {
+             $_SESSION['error_message'] = "خطأ في جلب بيانات السؤال للتعديل.";
+        }
+    }
+}
+
+// --- جلب قائمة الأسئلة الحالية لهذا الاختبار ---
+$questions = [];
+try {
+    $stmt_list = $pdo->prepare("SELECT question_id, question_text, question_type, question_order FROM questions WHERE test_id = :tid ORDER BY question_order ASC, question_id ASC");
+    $stmt_list->bindParam(':tid', $test_id, PDO::PARAM_INT);
+    $stmt_list->execute();
+    $questions = $stmt_list->fetchAll();
+} catch (PDOException $e) {
+    error_log("Instructor Manage Questions List Error: " . $e->getMessage());
+    $pageError = "حدث خطأ أثناء جلب قائمة الأسئلة.";
+}
+
+// --- تضمين الترويسة ---
+$pageTitle = "إدارة أسئلة: " . htmlspecialchars($test['test_title']);
+$isInstructorSection = true;
+require_once __DIR__ . '/../includes/header.php';
+?>
+
+<!-- محتوى الصفحة -->
+<div class="container main-content">
+    <h1>إدارة أسئلة اختبار: <?php echo htmlspecialchars($test['test_title']); ?></h1>
+    <p>
+        <a href="manage_tests.php?course_id=<?php echo $course['course_id']; ?>" class="btn btn-secondary btn-sm">« العودة لإدارة اختبارات الدورة (<?php echo htmlspecialchars($course['title']); ?>)</a>
+    </p>
+
+    <?php // عرض الرسائل
+        display_session_messages(); // استخدم الدالة الموحدة
+         if (!empty($errors)) { echo '<div class="alert alert-danger error-messages"><p><strong>الرجاء تصحيح الأخطاء التالية:</strong></p><ul>'; foreach ($errors as $error) { echo '<li>' . htmlspecialchars($error) . '</li>'; } echo '</ul></div>'; }
+        // رسالة pageError لن يتم عرضها عادة لأنها ستوجه المستخدم.
+    ?>
+
+    <!-- نموذج إضافة/تعديل السؤال والخيارات -->
+    <div class="dashboard-section">
+        <h3><?php echo $editQuestion ? 'تعديل السؤال' : 'إضافة سؤال جديد'; ?></h3>
+        <form action="manage_questions.php?test_id=<?php echo $test_id; ?>" method="post" class="basic-form" id="questionForm">
+            <input type="hidden" name="action" value="save_question">
+            <?php if ($editQuestion): ?>
+                <input type="hidden" name="question_id" value="<?php echo $editQuestion['question_id']; ?>">
+            <?php endif; ?>
+
+            <div>
+                <label for="question_text">نص السؤال:</label>
+                <textarea id="question_text" name="question_text" rows="4" required><?php echo htmlspecialchars($editQuestion['question_text'] ?? ''); ?></textarea>
+            </div>
+            <div>
+                <label for="question_type">نوع السؤال:</label>
+                <select id="question_type" name="question_type" required onchange="toggleOptions(this.value)">
+                    <option value="">-- اختر النوع --</option>
+                    <option value="MCQ" <?php echo (($editQuestion['question_type'] ?? '') === 'MCQ') ? 'selected' : ''; ?>>اختيار من متعدد (MCQ)</option>
+                    <option value="TRUE_FALSE" <?php echo (($editQuestion['question_type'] ?? '') === 'TRUE_FALSE') ? 'selected' : ''; ?>>صح / خطأ</option>
+                    <!-- *** تم إزالة خيار إجابة قصيرة من HTML *** -->
+                    <?php /*
+                    <option value="SHORT_ANSWER" <?php echo (($editQuestion['question_type'] ?? '') === 'SHORT_ANSWER') ? 'selected' : ''; ?>>إجابة قصيرة</option>
+                    */ ?>
+                </select>
+            </div>
+            <div>
+                <label for="question_order">ترتيب السؤال:</label>
+                <input type="number" id="question_order" name="question_order" value="<?php echo htmlspecialchars($editQuestion['question_order'] ?? 0); ?>" min="0">
+            </div>
+
+            <hr>
+
+            <!-- قسم الخيارات (يظهر بناءً على نوع السؤال) -->
+            <div id="options-mcq" style="display: none;">
+                <h4>خيارات الإجابة (اختيار من متعدد)</h4>
+                <p><small>حدد الخيار الصحيح باستخدام زر الراديو. يجب أن لا يقل عدد الخيارات عن 2.</small></p>
+                <div id="mcq-options-container">
+                    <?php
+                    $mcqOptionsData = ($editQuestion && $editQuestion['question_type'] === 'MCQ') ? $editOptions : [];
+                    // If it's a new question being re-populated from POST data, use that
+                    if (empty($mcqOptionsData) && !empty($errors) && ($current_post_data['question_type'] ?? '') === 'MCQ') {
+                         $mcqOptionsData = $editOptions; // This will contain data from $_POST on validation error
+                    }
+                    $optionCount = max(4, count($mcqOptionsData)); // Display at least 4 empty options or more if existing
+                    $correctIndex = null;
+                    foreach($mcqOptionsData as $idx => $opt) {
+                        if(isset($opt['is_correct']) && $opt['is_correct']) {
+                            $correctIndex = $idx;
+                            break;
+                        }
+                    }
+
+                    for ($i = 0; $i < $optionCount; $i++):
+                        $opt = $mcqOptionsData[$i] ?? ['option_id' => '', 'option_text' => '', 'is_correct' => false];
+                    ?>
+                    <div class="mcq-option" data-option-id="<?php echo htmlspecialchars($opt['option_id']); ?>">
+                         <input type="hidden" name="options[id][<?php echo $i; ?>]" value="<?php echo htmlspecialchars($opt['option_id']); ?>">
+                         <input type="radio" name="options[correct]" id="correct_<?php echo $i; ?>" value="<?php echo $i; ?>" <?php echo ($i === $correctIndex) ? 'checked' : ''; ?>>
+                         <input type="text" name="options[text][<?php echo $i; ?>]" placeholder="نص الخيار <?php echo ($i + 1); ?>" value="<?php echo htmlspecialchars($opt['option_text']); ?>">
+                         <?php if ($opt['option_id']): // Only show delete button for existing options with an ID ?>
+                            <button type="button" onclick="confirmDeleteOption(<?php echo $opt['option_id']; ?>, <?php echo $editQuestion['question_id'] ?? 'null'; ?>)" class="delete-link">× حذف</button>
+                         <?php else: ?>
+                            <span class="placeholder-delete-button"></span>
+                         <?php endif; ?>
+                    </div>
+                    <?php endfor; ?>
+                </div>
+                 <button type="button" onclick="addMcqOption()" class="btn btn-sm btn-secondary">إضافة خيار آخر</button>
+            </div>
+
+            <div id="options-true-false" style="display: none;">
+                 <h4>الإجابة الصحيحة (صح/خطأ)</h4>
+                  <?php
+                    $trueFalseCorrect = null;
+                    // Fetch real option IDs for TRUE_FALSE for correct form submission
+                    $tfOptions = [];
+                    if ($editQuestion && $editQuestion['question_type'] === 'TRUE_FALSE') {
+                        // $editOptions should already contain actual option IDs if loaded from DB
+                        foreach ($editOptions as $opt) {
+                            if (strtolower($opt['option_text']) == 'صحيح' || strtolower($opt['option_text']) == 'true') {
+                                $tfOptions['true'] = $opt;
+                            } elseif (strtolower($opt['option_text']) == 'خطأ' || strtolower($opt['option_text']) == 'false') {
+                                $tfOptions['false'] = $opt;
+                            }
+                        }
+                        if (isset($tfOptions['true']) && $tfOptions['true']['is_correct']) {
+                            $trueFalseCorrect = $tfOptions['true']['option_id'];
+                        } elseif (isset($tfOptions['false']) && $tfOptions['false']['is_correct']) {
+                            $trueFalseCorrect = $tfOptions['false']['option_id'];
+                        }
+                    } elseif(isset($_POST['true_false_correct'])) {
+                        // Re-populate from POST data if validation failed
+                        $trueFalseCorrect = intval($_POST['true_false_correct']);
+                    }
+                  ?>
+                 <div class="option-tf-group">
+                    <input type="hidden" name="options[id][true_placeholder]" value="<?php echo htmlspecialchars($tfOptions['true']['option_id'] ?? ''); ?>">
+                    <label>
+                        <input type="radio" name="true_false_correct" value="<?php echo htmlspecialchars($tfOptions['true']['option_id'] ?? '1'); ?>" <?php echo (($trueFalseCorrect !== null && $trueFalseCorrect == ($tfOptions['true']['option_id'] ?? '1')) ? 'checked' : ''); ?>> صحيح
+                    </label>
+                 </div>
+                 <div class="option-tf-group">
+                    <input type="hidden" name="options[id][false_placeholder]" value="<?php echo htmlspecialchars($tfOptions['false']['option_id'] ?? ''); ?>">
+                    <label>
+                        <input type="radio" name="true_false_correct" value="<?php echo htmlspecialchars($tfOptions['false']['option_id'] ?? '0'); ?>" <?php echo (($trueFalseCorrect !== null && $trueFalseCorrect == ($tfOptions['false']['option_id'] ?? '0')) ? 'checked' : ''); ?>> خطأ
+                    </label>
+                 </div>
+            </div>
+
+            <div id="options-short-answer" style="display: none;">
+                <!-- *** هذا القسم مخفي دائماً الآن بـ CSS و JavaScript *** -->
+                <h4>إجابة قصيرة</h4>
+                <p><small>هذا النوع من الأسئلة لا يحتوي على خيارات محددة للإجابة. يتم تصحيحه يدويًا.</small></p>
+            </div>
+
+            <hr>
+            <div>
+                <button type="submit" class="btn btn-primary"><?php echo $editQuestion ? 'حفظ التعديلات' : 'إضافة السؤال'; ?></button>
+                 <?php if ($editQuestion): ?>
+                    <a href="manage_questions.php?test_id=<?php echo $test_id; ?>" class="btn btn-secondary">إلغاء التعديل</a>
+                <?php endif; ?>
+            </div>
+        </form>
+    </div>
+
+    <!-- START: Hidden forms for deleting options. THESE MUST BE OUTSIDE THE MAIN <form id="questionForm">. -->
+    <?php 
+    $options_for_delete_forms = ($editQuestion && ($editQuestion['question_type'] === 'MCQ' || $editQuestion['question_type'] === 'TRUE_FALSE')) ? $editOptions : [];
+    if (!empty($errors) && ($current_post_data['question_type'] ?? '') === 'MCQ') {
+        $options_for_delete_forms = $editOptions; // Use posted data for re-population context
+    }
+    ?>
+    <?php foreach($options_for_delete_forms as $opt): ?>
+        <?php if ($opt['option_id']): // Only generate form for existing options that have an ID ?>
+        <form id="delete_option_form_<?php echo $opt['option_id']; ?>" 
+              action="manage_questions.php?test_id=<?php echo $test_id; ?>&edit_id=<?php echo $editQuestion['question_id'] ?? ''; ?>" 
+              method="post" 
+              style="display:none;">
+            <input type="hidden" name="action" value="delete_option">
+            <input type="hidden" name="option_id" value="<?php echo $opt['option_id']; ?>">
+            <input type="hidden" name="question_id" value="<?php echo $editQuestion['question_id'] ?? ''; ?>">
+        </form>
+        <?php endif; ?>
+    <?php endforeach; ?>
+    <!-- END: Hidden forms for deleting options. -->
+
+    <!-- قائمة الأسئلة الحالية -->
+    <div class="dashboard-section">
+        <h3>الأسئلة الحالية (<?php echo count($questions); ?>)</h3>
+         <?php if (empty($questions) && empty($pageError)): ?>
+            <p>لم يتم إضافة أسئلة لهذا الاختبار بعد.</p>
+        <?php elseif (!empty($questions)): ?>
+            <table class="data-table">
+                 <thead>
+                    <tr>
+                        <th>الترتيب</th>
+                        <th>السؤال</th>
+                        <th>النوع</th>
+                        <th>الإجراءات</th>
+                    </tr>
+                </thead>
+                <tbody>
+                     <?php foreach ($questions as $q): ?>
+                        <tr>
+                            <td><?php echo htmlspecialchars($q['question_order']); ?></td>
+                            <td><?php echo htmlspecialchars(mb_substr($q['question_text'], 0, 80, 'UTF-8')) . (mb_strlen($q['question_text'], 'UTF-8') > 80 ? '...' : ''); ?></td>
+                            <td><?php echo htmlspecialchars($q['question_type']); ?></td>
+                             <td class="actions">
+                                <a href="manage_questions.php?test_id=<?php echo $test_id; ?>&edit_id=<?php echo $q['question_id']; ?>" class="edit-link">تعديل</a>
+                                 |
+                                <form action="manage_questions.php?test_id=<?php echo $test_id; ?>" method="post" style="display: inline;" onsubmit="return confirm('هل أنت متأكد من حذف هذا السؤال وكل خياراته؟');">
+                                    <input type="hidden" name="action" value="delete_question">
+                                    <input type="hidden" name="question_id" value="<?php echo $q['question_id']; ?>">
+                                    <button type="submit" class="delete-link">حذف</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+    </div>
+</div> <!-- نهاية .container .main-content -->
+
+<?php
+require_once __DIR__ . '/../includes/footer.php';
+?>
+<script>
+    // Function to confirm and submit delete for an option
+    function confirmDeleteOption(optionId, questionId) {
+        if (confirm('هل أنت متأكد من حذف هذا الخيار؟')) {
+            const form = document.getElementById(`delete_option_form_${optionId}`);
+            if (form) {
+                form.submit();
+            } else {
+                console.error('Delete form not found for option ID:', optionId);
+                alert('خطأ: نموذج الحذف للخيار غير موجود.');
+            }
+        }
+    }
+
+    // Function to toggle display of options sections and manage 'required' attributes
+    function toggleOptions(questionType) {
+        const mcqDiv = document.getElementById('options-mcq');
+        const tfDiv = document.getElementById('options-true-false');
+        const saDiv = document.getElementById('options-short-answer'); // هذا القسم لن يتم عرضه الآن
+
+        // Reset all displays to none
+        mcqDiv.style.display = 'none';
+        tfDiv.style.display = 'none';
+        saDiv.style.display = 'none'; // تأكد أنه مخفي دائماً
+
+        // Remove 'required' from all potentially required fields in all sections
+        document.querySelectorAll('#mcq-options-container input[type="text"]').forEach(input => input.removeAttribute('required'));
+        document.querySelectorAll('#mcq-options-container input[type="radio"]').forEach(input => input.removeAttribute('required'));
+        document.querySelectorAll('#options-true-false input[type="radio"]').forEach(input => input.removeAttribute('required'));
+
+
+        if (questionType === 'MCQ') {
+            mcqDiv.style.display = 'block';
+            const mcqTextInputs = mcqDiv.querySelectorAll('input[type="text"]');
+
+            // Make the first two text options required for MCQ
+            if (mcqTextInputs[0]) mcqTextInputs[0].setAttribute('required', 'required');
+            if (mcqTextInputs[1]) mcqTextInputs[1].setAttribute('required', 'required');
+
+            // For MCQ correct answer radio:
+            const mcqRadios = mcqDiv.querySelectorAll('input[type="radio"][name="options[correct]"]');
+            let anyMcqRadioChecked = false;
+            mcqRadios.forEach(radio => {
+                if (radio.checked) anyMcqRadioChecked = true;
+                radio.removeAttribute('required'); 
+            });
+            if (!anyMcqRadioChecked && mcqRadios.length > 0) {
+                 mcqRadios[0].setAttribute('required', 'required');
+            }
+
+
+        } else if (questionType === 'TRUE_FALSE') {
+            tfDiv.style.display = 'block';
+            // Make True/False radio buttons required (one of them)
+            const tfRadios = tfDiv.querySelectorAll('input[type="radio"][name="true_false_correct"]');
+            let anyTfRadioChecked = false;
+            tfRadios.forEach(radio => {
+                if (radio.checked) anyTfRadioChecked = true;
+                radio.removeAttribute('required');
+            });
+            if (!anyTfRadioChecked && tfRadios.length > 0) {
+                 tfRadios[0].setAttribute('required', 'required');
+            }
+
+        } 
+        // *** تم إزالة الشرط الخاص بـ SHORT_ANSWER هنا من الـ JS ***
+        // else if (questionType === 'SHORT_ANSWER') {
+        //     saDiv.style.display = 'block';
+        // }
+    }
+
+    // Function to add a new MCQ option dynamically
+    function addMcqOption() {
+        const container = document.getElementById('mcq-options-container');
+        const optionIndex = container.children.length; 
+        const newOptionDiv = document.createElement('div');
+        newOptionDiv.className = 'mcq-option';
+        // *** تم إزالة inline styles من هنا، ستعتمد على CSS خارجي ***
+        // newOptionDiv.style.cssText = 'display: flex; align-items: center; margin-bottom: 10px;';
+
+        newOptionDiv.innerHTML = `
+            <input type="hidden" name="options[id][${optionIndex}]" value="">
+            <input type="radio" name="options[correct]" id="correct_${optionIndex}" value="${optionIndex}">
+            <label for="correct_${optionIndex}" class="sr-only">حدد كإجابة صحيحة</label> <!-- For accessibility, label the radio button -->
+            <input type="text" name="options[text][${optionIndex}]" placeholder="نص الخيار ${optionIndex + 1}">
+            <span class="placeholder-delete-button"></span> <!-- Placeholder for delete button -->
+        `;
+        container.appendChild(newOptionDiv);
+
+        // After adding a new option, re-apply validation logic for the radio buttons
+        const mcqRadios = container.querySelectorAll('input[type="radio"][name="options[correct]"]');
+        let anyMcqRadioChecked = false;
+        mcqRadios.forEach(radio => {
+            if (radio.checked) anyMcqRadioChecked = true;
+            radio.removeAttribute('required'); // Always remove required from all, then selectively re-apply
+        });
+        if (!anyMcqRadioChecked && mcqRadios.length > 0) {
+             mcqRadios[0].setAttribute('required', 'required');
+        }
+    }
+
+    // Initialize display on page load
+    document.addEventListener('DOMContentLoaded', function() {
+        const currentType = document.getElementById('question_type').value;
+        if(currentType) {
+            toggleOptions(currentType);
+        } else {
+            // If no type is selected (e.g., new question form), hide all option sections initially
+            toggleOptions(''); 
+        }
+
+        // Add change listener to the main form to re-evaluate radio 'required' when radios are clicked
+        document.getElementById('questionForm').addEventListener('change', function(event) {
+            if (event.target.type === 'radio' && (event.target.name === 'options[correct]' || event.target.name === 'true_false_correct')) {
+                // Re-run toggleOptions to correctly manage 'required' attributes after a radio selection
+                toggleOptions(document.getElementById('question_type').value);
+            }
+        });
+    });
+
+    // Helper for question delete confirmation (if used on the page)
+    // function confirmDelete(message) { return confirm(message); }
+</script>
